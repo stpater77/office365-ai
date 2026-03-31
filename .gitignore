@@ -1,0 +1,21 @@
+# Environment
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local runtime data
+open-webui/data/
+postgres/data/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log

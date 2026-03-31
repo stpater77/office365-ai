@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: office365-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: primary_brain
+      POSTGRES_USER: brain_user
+      POSTGRES_PASSWORD: change_this_now
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: office365-open-webui
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "3000:8080"
+    environment:
+      DATABASE_URL: postgresql://brain_user:change_this_now@postgres:5432/primary_brain
+      VECTOR_DB: pgvector
+      PGVECTOR_DB_URL: postgresql://brain_user:change_this_now@postgres:5432/primary_brain
+      WEBUI_AUTH: "True"
+    volumes:
+      - ./open-webui/data:/app/backend/data
+
+  brain-api:
+    build: ./brain-api
+    container_name: office365-brain-api
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://brain_user:change_this_now@postgres:5432/primary_brain
+      MICROSOFT_TENANT_ID: d1df2767-70e5-4637-bef8-32c13921561d
+      MICROSOFT_CLIENT_ID: e2f73028-2705-4419-a8d9-9df5256e7496
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET}
+      OPENAI_API_KEY: your_openai_key
+      OPENAI_BASE_URL: https://api.openai.com/v1
+      EMBEDDING_MODEL: text-embedding-3-small
+      CHAT_MODEL: gpt-4.1-mini
+    volumes:
+      - ./brain-api:/app
