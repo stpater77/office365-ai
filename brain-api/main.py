@@ -1,4 +1,3 @@
-
 import io
 import os
 import re
@@ -8,6 +7,11 @@ from typing import Any
 import psycopg
 import requests
 from fastapi import FastAPI, HTTPException
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
 
 try:
     from pypdf import PdfReader
@@ -100,12 +104,8 @@ def graph_get_json(url: str, token: str, params: dict[str, Any] | None = None) -
     return resp.json()
 
 
-def graph_get_bytes(url: str, token: str) -> bytes:
-    resp = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=180,
-    )
+def graph_get_bytes(url: str) -> bytes:
+    resp = requests.get(url, timeout=180)
     resp.raise_for_status()
     return resp.content
 
@@ -141,6 +141,35 @@ def extract_text_from_bytes(filename: str, mime_type: str | None, content: bytes
             return content.decode("utf-8")
         except UnicodeDecodeError:
             return content.decode("latin-1", errors="ignore")
+
+    if (
+        mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or filename.endswith(".docx")
+    ):
+        if Document is None:
+            return ""
+        try:
+            doc = Document(io.BytesIO(content))
+            parts: list[str] = []
+
+            for para in doc.paragraphs:
+                text = (para.text or "").strip()
+                if text:
+                    parts.append(text)
+
+            for table in doc.tables:
+                for row in table.rows:
+                    row_cells = []
+                    for cell in row.cells:
+                        cell_text = (cell.text or "").strip()
+                        if cell_text:
+                            row_cells.append(cell_text)
+                    if row_cells:
+                        parts.append(" | ".join(row_cells))
+
+            return "\n".join(parts).strip()
+        except Exception:
+            return ""
 
     if mime_type == "application/pdf" or filename.endswith(".pdf"):
         if PdfReader is None:
@@ -327,7 +356,7 @@ def sync_sharepoint_drive(site_id: str, drive_id: str):
 
                     if download_url:
                         try:
-                            file_bytes = graph_get_bytes(download_url, token="")
+                            file_bytes = graph_get_bytes(download_url)
                             extracted_text = extract_text_from_bytes(name, mime_type, file_bytes)
                         except requests.HTTPError as exc:
                             errors.append(
@@ -464,4 +493,3 @@ def list_file_chunks(limit: int = 100):
         )
 
     return {"ok": True, "chunks": results}
-

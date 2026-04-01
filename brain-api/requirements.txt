@@ -9,3 +9,4 @@ openai
 tiktoken
 python-docx
 pypdf
+
