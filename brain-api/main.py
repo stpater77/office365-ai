@@ -2,12 +2,11 @@ import io
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any
-
-from dotenv import load_dotenv
+from typing import Any, Optional
 
 import psycopg
 import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
@@ -30,10 +29,31 @@ app = FastAPI(title="Office365 Brain API")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 
+# --------------------------------------------------------------------
+# Request models
+# --------------------------------------------------------------------
+
 class ChatRequest(BaseModel):
     question: str
     top_k: int = 5
 
+
+class OpenAIChatMessage(BaseModel):
+    role: str
+    content: Any
+
+
+class OpenAIChatRequest(BaseModel):
+    model: str
+    messages: list[OpenAIChatMessage]
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    stream: Optional[bool] = False
+
+
+# --------------------------------------------------------------------
+# General utilities
+# --------------------------------------------------------------------
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -57,15 +77,28 @@ def get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY")
+
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+
     return OpenAI(api_key=api_key)
 
 
 def get_chat_model() -> str:
-    return os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+    return (
+        os.getenv("OPENAI_CHAT_MODEL")
+        or os.getenv("CHAT_MODEL")
+        or "gpt-4.1-mini"
+    )
 
 
 def get_embedding_model() -> str:
-    return os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    return (
+        os.getenv("OPENAI_EMBEDDING_MODEL")
+        or os.getenv("EMBEDDING_MODEL")
+        or "text-embedding-3-small"
+    )
 
 
 def get_public_model_id() -> str:
@@ -96,6 +129,53 @@ def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> list[st
     return chunks
 
 
+def vector_literal(values: list[float]) -> str:
+    return "[" + ",".join(str(x) for x in values) + "]"
+
+
+def parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def extract_user_question_from_messages(messages: list[OpenAIChatMessage]) -> str:
+    if not messages:
+        return ""
+
+    for msg in reversed(messages):
+        if msg.role != "user":
+            continue
+
+        content = msg.content
+
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_value = item.get("text")
+                    if text_value:
+                        text_parts.append(str(text_value))
+            return "\n".join(text_parts).strip()
+
+        return str(content).strip()
+
+    return ""
+
+
+# --------------------------------------------------------------------
+# Microsoft Graph helpers
+# --------------------------------------------------------------------
+
 def get_graph_token() -> str:
     tenant_id = get_required_env("MICROSOFT_TENANT_ID")
     client_id = get_required_env("MICROSOFT_CLIENT_ID")
@@ -118,117 +198,35 @@ def get_graph_token() -> str:
     access_token = data.get("access_token")
     if not access_token:
         raise RuntimeError("Microsoft token response did not include access_token")
-
     return access_token
 
 
-def graph_get_json(url: str, token: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def graph_get_json(url: str, token: str) -> dict[str, Any]:
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {token}"},
-        params=params,
         timeout=120,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def graph_get_bytes(url: str) -> bytes:
-    resp = requests.get(url, timeout=180)
+def graph_get_bytes(url: str, token: str) -> bytes:
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=120,
+    )
     resp.raise_for_status()
     return resp.content
 
 
-def parse_graph_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def extract_text_from_bytes(filename: str, mime_type: str | None, content: bytes) -> str:
-    mime_type = (mime_type or "").lower()
-    filename = (filename or "").lower()
-
-    if not content:
-        return ""
-
-    text_like = (
-        mime_type.startswith("text/")
-        or filename.endswith(".txt")
-        or filename.endswith(".md")
-        or filename.endswith(".csv")
-        or filename.endswith(".json")
-        or filename.endswith(".xml")
-        or filename.endswith(".html")
-        or filename.endswith(".htm")
-    )
-    if text_like:
-        try:
-            return content.decode("utf-8")
-        except UnicodeDecodeError:
-            return content.decode("latin-1", errors="ignore")
-
-    if (
-        mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        or filename.endswith(".docx")
-    ):
-        if Document is None:
-            return ""
-        try:
-            doc = Document(io.BytesIO(content))
-            parts: list[str] = []
-
-            for para in doc.paragraphs:
-                text = (para.text or "").strip()
-                if text:
-                    parts.append(text)
-
-            for table in doc.tables:
-                for row in table.rows:
-                    row_cells = []
-                    for cell in row.cells:
-                        cell_text = (cell.text or "").strip()
-                        if cell_text:
-                            row_cells.append(cell_text)
-                    if row_cells:
-                        parts.append(" | ".join(row_cells))
-
-            return "\n".join(parts).strip()
-        except Exception:
-            return ""
-
-    if mime_type == "application/pdf" or filename.endswith(".pdf"):
-        if PdfReader is None:
-            return ""
-        try:
-            reader = PdfReader(io.BytesIO(content))
-            pages: list[str] = []
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            return "\n".join(pages).strip()
-        except Exception:
-            return ""
-
-    return ""
-
-
-def embed_text(text: str) -> list[float]:
-    text = (text or "").strip()
-    if not text:
-        raise RuntimeError("Cannot embed empty text")
-
-    client = get_openai_client()
-    resp = client.embeddings.create(
-        model=get_embedding_model(),
-        input=text,
-    )
-    return resp.data[0].embedding
-
-
-def list_drive_children(site_id: str, drive_id: str, item_id: str | None, token: str) -> list[dict[str, Any]]:
+def list_drive_children(
+    site_id: str,
+    drive_id: str,
+    item_id: str | None,
+    token: str,
+) -> list[dict[str, Any]]:
     if item_id:
         url = f"{GRAPH_BASE}/sites/{site_id}/drives/{drive_id}/items/{item_id}/children"
     else:
@@ -244,7 +242,12 @@ def list_drive_children(site_id: str, drive_id: str, item_id: str | None, token:
     return items
 
 
-def walk_drive_files(site_id: str, drive_id: str, token: str, folder_id: str | None = None) -> list[dict[str, Any]]:
+def walk_drive_files(
+    site_id: str,
+    drive_id: str,
+    token: str,
+    folder_id: str | None = None,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
     for item in list_drive_children(site_id, drive_id, folder_id, token):
@@ -254,6 +257,88 @@ def walk_drive_files(site_id: str, drive_id: str, token: str, folder_id: str | N
             results.append(item)
 
     return results
+
+
+# --------------------------------------------------------------------
+# File extraction
+# --------------------------------------------------------------------
+
+def extract_text_from_docx_bytes(data: bytes) -> str:
+    if Document is None:
+        return ""
+    try:
+        doc = Document(io.BytesIO(data))
+        parts: list[str] = []
+        for para in doc.paragraphs:
+            text = (para.text or "").strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    if PdfReader is None:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages: list[str] = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        return "\n".join(pages).strip()
+    except Exception:
+        return ""
+
+
+def extract_text_from_plain_bytes(data: bytes) -> str:
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(encoding, errors="ignore").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def extract_text_from_file_bytes(data: bytes, mime_type: str | None, name: str) -> str:
+    mime_type = mime_type or ""
+    lower_name = (name or "").lower()
+
+    if "wordprocessingml.document" in mime_type or lower_name.endswith(".docx"):
+        return extract_text_from_docx_bytes(data)
+
+    if "pdf" in mime_type or lower_name.endswith(".pdf"):
+        return extract_text_from_pdf_bytes(data)
+
+    if (
+        mime_type.startswith("text/")
+        or lower_name.endswith(".txt")
+        or lower_name.endswith(".md")
+        or lower_name.endswith(".csv")
+        or lower_name.endswith(".json")
+        or lower_name.endswith(".html")
+        or lower_name.endswith(".xml")
+    ):
+        return extract_text_from_plain_bytes(data)
+
+    return ""
+
+
+# --------------------------------------------------------------------
+# Embeddings and retrieval
+# --------------------------------------------------------------------
+
+def embed_text(text: str) -> list[float]:
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("Cannot embed empty text")
+
+    client = get_openai_client()
+    resp = client.embeddings.create(
+        model=get_embedding_model(),
+        input=text,
+    )
+    return resp.data[0].embedding
 
 
 def upsert_file_record(
@@ -319,7 +404,7 @@ def upsert_file_record(
     return row[0]
 
 
-def upsert_file_chunks(cur, file_id, extracted_text: str) -> int:
+def upsert_file_chunks(cur, file_id: int, extracted_text: str) -> int:
     cur.execute(
         """
         DELETE FROM office365.file_chunks
@@ -333,21 +418,22 @@ def upsert_file_chunks(cur, file_id, extracted_text: str) -> int:
         return 0
 
     for idx, chunk in enumerate(chunks):
+        embedding = vector_literal(embed_text(chunk))
         cur.execute(
             """
             INSERT INTO office365.file_chunks
-            (file_id, chunk_index, content)
-            VALUES (%s, %s, %s)
+            (file_id, chunk_index, content, embedding)
+            VALUES (%s, %s, %s, %s::vector)
             """,
-            (file_id, idx, chunk),
+            (file_id, idx, chunk, embedding),
         )
 
     return len(chunks)
 
 
-def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str, Any]]:
     top_k = max(1, min(top_k, 20))
-    question_embedding = embed_text(question)
+    question_embedding = vector_literal(embed_text(question))
 
     with get_db_conn() as conn:
         with conn.cursor() as cur:
@@ -381,9 +467,64 @@ def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]
                 "web_url": row[3],
                 "chunk_index": row[4],
                 "content": row[5],
+                "retrieval_mode": "vector",
             }
         )
     return results
+
+
+def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+    top_k = max(1, min(top_k, 20))
+    query = f"%{question.strip()}%"
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    f.id,
+                    f.microsoft_file_id,
+                    f.name,
+                    f.web_url,
+                    fc.chunk_index,
+                    fc.content
+                FROM office365.file_chunks fc
+                JOIN office365.files f
+                  ON f.id = fc.file_id
+                WHERE fc.content ILIKE %s
+                ORDER BY f.updated_at DESC, fc.chunk_index ASC
+                LIMIT %s
+                """,
+                (query, top_k),
+            )
+            rows = cur.fetchall()
+
+    results = []
+    for row in rows:
+        results.append(
+            {
+                "file_id": row[0],
+                "microsoft_file_id": row[1],
+                "name": row[2],
+                "web_url": row[3],
+                "chunk_index": row[4],
+                "content": row[5],
+                "retrieval_mode": "keyword",
+            }
+        )
+    return results
+
+
+def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+    try:
+        results = search_similar_chunks_vector(question, top_k)
+        if results:
+            return results
+    except Exception:
+        # Fall through to keyword search
+        pass
+
+    return search_similar_chunks_keyword(question, top_k)
 
 
 def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
@@ -405,6 +546,7 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
             f"[Source {i}] File: {chunk['name']}\n"
             f"URL: {chunk['web_url']}\n"
             f"Chunk Index: {chunk['chunk_index']}\n"
+            f"Retrieval Mode: {chunk.get('retrieval_mode', 'unknown')}\n"
             f"Content:\n{chunk['content']}"
         )
 
@@ -412,7 +554,8 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
 
     system_prompt = (
         "You answer questions using only the provided SharePoint document context. "
-        "If the answer is not supported by the context, say you do not know."
+        "If the answer is not supported by the context, say you do not know. "
+        "Prefer concise factual answers and include bullet points when asked to summarize."
     )
 
     user_prompt = f"""Question:
@@ -443,6 +586,10 @@ Context:
     }
 
 
+# --------------------------------------------------------------------
+# API routes
+# --------------------------------------------------------------------
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "office365-brain-api"}
@@ -451,224 +598,6 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "service": "office365-brain-api"}
-
-
-@app.post("/sync/sharepoint/{site_id}/{drive_id}")
-def sync_sharepoint_drive(site_id: str, drive_id: str):
-    try:
-        token = get_graph_token()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Microsoft auth failed: {exc}") from exc
-
-    try:
-        files = walk_drive_files(site_id, drive_id, token)
-    except requests.HTTPError as exc:
-        detail = exc.response.text if exc.response is not None else str(exc)
-        raise HTTPException(status_code=500, detail=f"Graph list failed: {detail}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Graph list failed: {exc}") from exc
-
-    processed_files = 0
-    inserted_chunks_total = 0
-    skipped_files = 0
-    errors: list[dict[str, Any]] = []
-
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            for item in files:
-                try:
-                    microsoft_file_id = item.get("id")
-                    if not microsoft_file_id:
-                        skipped_files += 1
-                        continue
-
-                    name = item.get("name") or "Unnamed file"
-                    web_url = item.get("webUrl")
-                    mime_type = ((item.get("file") or {}).get("mimeType")) or item.get("mimeType")
-                    owner_microsoft_user_id = (
-                        (((item.get("createdBy") or {}).get("user") or {}).get("id"))
-                        or (((item.get("lastModifiedBy") or {}).get("user") or {}).get("id"))
-                    )
-                    last_modified_at = parse_graph_datetime(item.get("lastModifiedDateTime"))
-
-                    download_url = item.get("@microsoft.graph.downloadUrl")
-                    extracted_text = ""
-
-                    if download_url:
-                        try:
-                            file_bytes = graph_get_bytes(download_url)
-                            extracted_text = extract_text_from_bytes(name, mime_type, file_bytes)
-                        except requests.HTTPError as exc:
-                            errors.append(
-                                {
-                                    "file": name,
-                                    "microsoft_file_id": microsoft_file_id,
-                                    "error": f"Download failed: {exc}",
-                                }
-                            )
-                        except Exception as exc:
-                            errors.append(
-                                {
-                                    "file": name,
-                                    "microsoft_file_id": microsoft_file_id,
-                                    "error": f"Extraction failed: {exc}",
-                                }
-                            )
-
-                    file_id = upsert_file_record(
-                        cur=cur,
-                        microsoft_file_id=microsoft_file_id,
-                        owner_microsoft_user_id=owner_microsoft_user_id,
-                        source_type="sharepoint_drive",
-                        name=name,
-                        web_url=web_url,
-                        mime_type=mime_type,
-                        last_modified_at=last_modified_at,
-                        raw_metadata=item,
-                        extracted_text=extracted_text,
-                    )
-
-                    inserted_chunks = upsert_file_chunks(cur, file_id, extracted_text)
-                    inserted_chunks_total += inserted_chunks
-                    processed_files += 1
-
-                except Exception as exc:
-                    errors.append(
-                        {
-                            "file": item.get("name"),
-                            "microsoft_file_id": item.get("id"),
-                            "error": str(exc),
-                        }
-                    )
-
-        conn.commit()
-
-    return {
-        "ok": True,
-        "site_id": site_id,
-        "drive_id": drive_id,
-        "processed_files": processed_files,
-        "inserted_chunks": inserted_chunks_total,
-        "skipped_files": skipped_files,
-        "errors": errors[:25],
-        "error_count": len(errors),
-    }
-
-
-@app.post("/embed/backfill")
-def embed_backfill(limit: int = 100):
-    limit = max(1, min(limit, 500))
-
-    updated = 0
-    errors: list[dict[str, Any]] = []
-
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, content
-                FROM office365.file_chunks
-                WHERE content IS NOT NULL
-                  AND content <> ''
-                  AND embedding IS NULL
-                ORDER BY id
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-
-            for row in rows:
-                chunk_id = row[0]
-                content = row[1]
-
-                try:
-                    embedding = embed_text(content)
-                    cur.execute(
-                        """
-                        UPDATE office365.file_chunks
-                        SET embedding = %s
-                        WHERE id = %s
-                        """,
-                        (embedding, chunk_id),
-                    )
-                    updated += 1
-                except Exception as exc:
-                    errors.append({"chunk_id": chunk_id, "error": str(exc)})
-
-        conn.commit()
-
-    return {
-        "ok": True,
-        "updated": updated,
-        "error_count": len(errors),
-        "errors": errors[:20],
-    }
-
-
-@app.post("/chat")
-def chat(req: ChatRequest):
-    result = answer_question(req.question, req.top_k)
-    return {
-        "ok": True,
-        "answer": result["answer"],
-        "sources": result["sources"],
-    }
-
-
-@app.get("/v1/models")
-def v1_models():
-    model_id = get_public_model_id()
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": model_id,
-                "object": "model",
-                "owned_by": "office365-brain-api",
-            }
-        ],
-    }
-
-
-@app.post("/v1/chat/completions")
-def v1_chat_completions(payload: dict[str, Any]):
-    messages = payload.get("messages", [])
-    if not isinstance(messages, list) or not messages:
-        raise HTTPException(status_code=400, detail="messages are required")
-
-    user_messages = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
-    if not user_messages:
-        raise HTTPException(status_code=400, detail="at least one user message is required")
-
-    last_user = user_messages[-1]
-    question = (last_user.get("content") or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="user message content is required")
-
-    top_k = 5
-    result = answer_question(question, top_k=top_k)
-    answer = result["answer"]
-
-    created_ts = int(datetime.now(timezone.utc).timestamp())
-    requested_model = payload.get("model") or get_public_model_id()
-
-    return {
-        "id": f"chatcmpl-{created_ts}",
-        "object": "chat.completion",
-        "created": created_ts,
-        "model": requested_model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": answer,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-    }
 
 
 @app.get("/files")
@@ -687,16 +616,16 @@ def list_files(limit: int = 100):
                     last_modified_at,
                     updated_at
                 FROM office365.files
-                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                ORDER BY updated_at DESC
                 LIMIT %s
                 """,
                 (limit,),
             )
             rows = cur.fetchall()
 
-    items = []
+    files = []
     for row in rows:
-        items.append(
+        files.append(
             {
                 "microsoft_file_id": row[0],
                 "name": row[1],
@@ -707,7 +636,7 @@ def list_files(limit: int = 100):
             }
         )
 
-    return {"ok": True, "files": items}
+    return {"ok": True, "files": files}
 
 
 @app.get("/file-chunks")
@@ -728,16 +657,16 @@ def list_file_chunks(limit: int = 100):
                 FROM office365.file_chunks fc
                 JOIN office365.files f
                   ON f.id = fc.file_id
-                ORDER BY f.updated_at DESC NULLS LAST, fc.chunk_index ASC
+                ORDER BY f.updated_at DESC, fc.chunk_index ASC
                 LIMIT %s
                 """,
                 (limit,),
             )
             rows = cur.fetchall()
 
-    results = []
+    chunks = []
     for row in rows:
-        results.append(
+        chunks.append(
             {
                 "microsoft_file_id": row[0],
                 "name": row[1],
@@ -748,4 +677,137 @@ def list_file_chunks(limit: int = 100):
             }
         )
 
-    return {"ok": True, "chunks": results}
+    return {"ok": True, "chunks": chunks}
+
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    return answer_question(req.question, top_k=req.top_k)
+
+
+@app.post("/sync/sharepoint/{site_id}/{drive_id}")
+def sync_sharepoint_drive(site_id: str, drive_id: str):
+    try:
+        token = get_graph_token()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Graph auth failed: {exc}") from exc
+
+    try:
+        items = walk_drive_files(site_id, drive_id, token)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Drive walk failed: {exc}") from exc
+
+    inserted_or_updated = 0
+    processed_files = 0
+    chunk_count_total = 0
+    skipped_files = 0
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            for item in items:
+                microsoft_file_id = item.get("id")
+                name = item.get("name") or "unknown"
+                web_url = item.get("webUrl")
+                last_modified_at = parse_iso_datetime(item.get("lastModifiedDateTime"))
+                raw_metadata = item
+                file_facet = item.get("file") or {}
+                mime_type = file_facet.get("mimeType")
+                owner_microsoft_user_id = site_id
+
+                download_url = item.get("@microsoft.graph.downloadUrl")
+                extracted_text = ""
+
+                if download_url:
+                    try:
+                        file_bytes = graph_get_bytes(download_url, token="")
+                    except Exception:
+                        try:
+                            resp = requests.get(download_url, timeout=120)
+                            resp.raise_for_status()
+                            file_bytes = resp.content
+                        except Exception:
+                            file_bytes = b""
+
+                    if file_bytes:
+                        extracted_text = extract_text_from_file_bytes(file_bytes, mime_type, name)
+
+                try:
+                    file_id = upsert_file_record(
+                        cur=cur,
+                        microsoft_file_id=microsoft_file_id,
+                        owner_microsoft_user_id=owner_microsoft_user_id,
+                        source_type="sharepoint",
+                        name=name,
+                        web_url=web_url,
+                        mime_type=mime_type,
+                        last_modified_at=last_modified_at,
+                        raw_metadata=raw_metadata,
+                        extracted_text=extracted_text,
+                    )
+
+                    num_chunks = upsert_file_chunks(cur, file_id, extracted_text)
+                    inserted_or_updated += 1
+                    processed_files += 1
+                    chunk_count_total += num_chunks
+                except Exception as exc:
+                    skipped_files += 1
+                    print(f"Failed processing file {name} ({microsoft_file_id}): {exc}")
+
+            conn.commit()
+
+    return {
+        "ok": True,
+        "site_id": site_id,
+        "drive_id": drive_id,
+        "fetched": len(items),
+        "processed_files": processed_files,
+        "skipped_files": skipped_files,
+        "files_upserted": inserted_or_updated,
+        "chunks_upserted": chunk_count_total,
+    }
+
+
+# --------------------------------------------------------------------
+# OpenAI-compatible routes for Open WebUI
+# --------------------------------------------------------------------
+
+@app.get("/v1/models")
+def v1_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": get_public_model_id(),
+                "object": "model",
+                "owned_by": "office365-brain-api",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+def v1_chat_completions(req: OpenAIChatRequest):
+    question = extract_user_question_from_messages(req.messages)
+    top_k = 5
+
+    result = answer_question(question, top_k=top_k)
+    answer = result["answer"]
+
+    created = int(utcnow().timestamp())
+
+    return {
+        "id": f"chatcmpl-{created}",
+        "object": "chat.completion",
+        "created": created,
+        "model": get_public_model_id(),
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": answer,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
