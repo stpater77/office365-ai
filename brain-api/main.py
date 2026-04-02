@@ -4,9 +4,13 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from dotenv import load_dotenv
+
 import psycopg
 import requests
 from fastapi import FastAPI, HTTPException
+from openai import OpenAI
+from pydantic import BaseModel
 
 try:
     from docx import Document
@@ -19,10 +23,16 @@ except Exception:
     PdfReader = None
 
 
+load_dotenv()
+
 app = FastAPI(title="Office365 Brain API")
 
-
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+class ChatRequest(BaseModel):
+    question: str
+    top_k: int = 5
 
 
 def utcnow() -> datetime:
@@ -41,6 +51,25 @@ def get_db_conn():
     if not database_url:
         raise RuntimeError("Missing DATABASE_URL")
     return psycopg.connect(database_url)
+
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+    return OpenAI(api_key=api_key)
+
+
+def get_chat_model() -> str:
+    return os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+
+
+def get_embedding_model() -> str:
+    return os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+
+def get_public_model_id() -> str:
+    return os.getenv("PUBLIC_MODEL_ID", "office365-assistant")
 
 
 def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> list[str]:
@@ -186,6 +215,19 @@ def extract_text_from_bytes(filename: str, mime_type: str | None, content: bytes
     return ""
 
 
+def embed_text(text: str) -> list[float]:
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("Cannot embed empty text")
+
+    client = get_openai_client()
+    resp = client.embeddings.create(
+        model=get_embedding_model(),
+        input=text,
+    )
+    return resp.data[0].embedding
+
+
 def list_drive_children(site_id: str, drive_id: str, item_id: str | None, token: str) -> list[dict[str, Any]]:
     if item_id:
         url = f"{GRAPH_BASE}/sites/{site_id}/drives/{drive_id}/items/{item_id}/children"
@@ -303,6 +345,104 @@ def upsert_file_chunks(cur, file_id, extracted_text: str) -> int:
     return len(chunks)
 
 
+def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+    top_k = max(1, min(top_k, 20))
+    question_embedding = embed_text(question)
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    f.id,
+                    f.microsoft_file_id,
+                    f.name,
+                    f.web_url,
+                    fc.chunk_index,
+                    fc.content
+                FROM office365.file_chunks fc
+                JOIN office365.files f
+                  ON f.id = fc.file_id
+                WHERE fc.embedding IS NOT NULL
+                ORDER BY fc.embedding <-> %s::vector
+                LIMIT %s
+                """,
+                (question_embedding, top_k),
+            )
+            rows = cur.fetchall()
+
+    results = []
+    for row in rows:
+        results.append(
+            {
+                "file_id": row[0],
+                "microsoft_file_id": row[1],
+                "name": row[2],
+                "web_url": row[3],
+                "chunk_index": row[4],
+                "content": row[5],
+            }
+        )
+    return results
+
+
+def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
+    question = (question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    chunks = search_similar_chunks(question, top_k)
+
+    if not chunks:
+        return {
+            "answer": "I do not know based on the currently indexed documents.",
+            "sources": [],
+        }
+
+    context_parts = []
+    for i, chunk in enumerate(chunks, start=1):
+        context_parts.append(
+            f"[Source {i}] File: {chunk['name']}\n"
+            f"URL: {chunk['web_url']}\n"
+            f"Chunk Index: {chunk['chunk_index']}\n"
+            f"Content:\n{chunk['content']}"
+        )
+
+    context_text = "\n\n---\n\n".join(context_parts)
+
+    system_prompt = (
+        "You answer questions using only the provided SharePoint document context. "
+        "If the answer is not supported by the context, say you do not know."
+    )
+
+    user_prompt = f"""Question:
+{question}
+
+Context:
+{context_text}
+"""
+
+    try:
+        client = get_openai_client()
+        resp = client.chat.completions.create(
+            model=get_chat_model(),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OpenAI chat failed: {exc}") from exc
+
+    answer = resp.choices[0].message.content or ""
+
+    return {
+        "answer": answer,
+        "sources": chunks,
+    }
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "office365-brain-api"}
@@ -412,6 +552,122 @@ def sync_sharepoint_drive(site_id: str, drive_id: str):
         "skipped_files": skipped_files,
         "errors": errors[:25],
         "error_count": len(errors),
+    }
+
+
+@app.post("/embed/backfill")
+def embed_backfill(limit: int = 100):
+    limit = max(1, min(limit, 500))
+
+    updated = 0
+    errors: list[dict[str, Any]] = []
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, content
+                FROM office365.file_chunks
+                WHERE content IS NOT NULL
+                  AND content <> ''
+                  AND embedding IS NULL
+                ORDER BY id
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+
+            for row in rows:
+                chunk_id = row[0]
+                content = row[1]
+
+                try:
+                    embedding = embed_text(content)
+                    cur.execute(
+                        """
+                        UPDATE office365.file_chunks
+                        SET embedding = %s
+                        WHERE id = %s
+                        """,
+                        (embedding, chunk_id),
+                    )
+                    updated += 1
+                except Exception as exc:
+                    errors.append({"chunk_id": chunk_id, "error": str(exc)})
+
+        conn.commit()
+
+    return {
+        "ok": True,
+        "updated": updated,
+        "error_count": len(errors),
+        "errors": errors[:20],
+    }
+
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    result = answer_question(req.question, req.top_k)
+    return {
+        "ok": True,
+        "answer": result["answer"],
+        "sources": result["sources"],
+    }
+
+
+@app.get("/v1/models")
+def v1_models():
+    model_id = get_public_model_id()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "owned_by": "office365-brain-api",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+def v1_chat_completions(payload: dict[str, Any]):
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages are required")
+
+    user_messages = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="at least one user message is required")
+
+    last_user = user_messages[-1]
+    question = (last_user.get("content") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="user message content is required")
+
+    top_k = 5
+    result = answer_question(question, top_k=top_k)
+    answer = result["answer"]
+
+    created_ts = int(datetime.now(timezone.utc).timestamp())
+    requested_model = payload.get("model") or get_public_model_id()
+
+    return {
+        "id": f"chatcmpl-{created_ts}",
+        "object": "chat.completion",
+        "created": created_ts,
+        "model": requested_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": answer,
+                },
+                "finish_reason": "stop",
+            }
+        ],
     }
 
 
