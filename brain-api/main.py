@@ -29,6 +29,16 @@ app = FastAPI(title="Office365 Brain API")
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+ROUTE_SOURCE_TYPES: dict[str, list[str]] = {
+    "admin": ["m365-admin", "outlook-admin", "copilot", "sharepoint", "teams"],
+    "developer": ["graph", "outlook-developer"],
+    "training": ["outlook-training", "teams", "sharepoint"],
+    "sharepoint": ["sharepoint"],
+    "teams": ["teams"],
+    "copilot": ["copilot"],
+    "ambiguous": [],
+}
+
 
 # --------------------------------------------------------------------
 # Request models
@@ -104,6 +114,31 @@ def get_embedding_model() -> str:
 
 def get_public_model_id() -> str:
     return os.getenv("PUBLIC_MODEL_ID", "office365-assistant")
+
+
+def get_web_fallback_enabled() -> bool:
+    value = (os.getenv("WEB_FALLBACK_ENABLED") or "false").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def get_web_fallback_provider() -> str:
+    return (os.getenv("WEB_FALLBACK_PROVIDER") or "openai").strip().lower()
+
+
+def get_web_fallback_model() -> str:
+    return os.getenv("WEB_FALLBACK_CHAT_MODEL") or "gpt-5.4"
+
+
+def get_web_fallback_client() -> OpenAI:
+    api_key = os.getenv("WEB_FALLBACK_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing WEB_FALLBACK_API_KEY and OPENAI_API_KEY")
+
+    base_url = os.getenv("WEB_FALLBACK_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+
+    return OpenAI(api_key=api_key)
 
 
 def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> list[str]:
@@ -184,31 +219,17 @@ def normalize_whitespace(value: str | None) -> str:
 
 
 def normalize_title(title: str | None) -> str:
-    """
-    Create a stable title key for doc-family dedupe.
-    """
     value = normalize_whitespace(title).lower()
-
-    # remove common site suffixes/prefixes that create noisy variants
     value = re.sub(r"\s*\|\s*microsoft learn\s*$", "", value)
     value = re.sub(r"\s*-\s*microsoft graph\s*\|\s*microsoft learn\s*$", "", value)
     value = re.sub(r"\s*-\s*microsoft teams\s*\|\s*microsoft learn\s*$", "", value)
     value = re.sub(r"\s*-\s*microsoft 365 copilot connectors\s*\|\s*microsoft learn\s*$", "", value)
-
-    # collapse punctuation spacing
     value = re.sub(r"[\|\-–—:]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
 def canonicalize_url(url: str | None) -> str:
-    """
-    Canonicalize URL aggressively enough to collapse common Learn variants:
-    - removes query string and fragment
-    - lowercases host/path
-    - removes trailing slash
-    - collapses duplicate slashes
-    """
     if not url:
         return ""
 
@@ -234,23 +255,14 @@ def canonicalize_url(url: str | None) -> str:
 
 
 def doc_family_key(chunk: dict[str, Any]) -> str:
-    """
-    Prefer canonical URL family. Fall back to normalized title.
-    This is intentionally stronger than file-id-only dedupe.
-    """
     canonical_url = canonicalize_url(chunk.get("web_url"))
     normalized_title = normalize_title(chunk.get("name"))
     microsoft_file_id = (chunk.get("microsoft_file_id") or "").strip()
 
-    # Best key: canonical URL path
     if canonical_url:
         return f"url:{canonical_url}"
-
-    # Next best: normalized title
     if normalized_title:
         return f"title:{normalized_title}"
-
-    # Fallbacks
     if microsoft_file_id:
         return f"id:{microsoft_file_id}"
 
@@ -258,10 +270,6 @@ def doc_family_key(chunk: dict[str, Any]) -> str:
 
 
 def dedupe_chunks(chunks: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
-    """
-    Keep only the first/best-ranked chunk per document family.
-    Input order is already ranked by retrieval, so earlier wins.
-    """
     deduped: list[dict[str, Any]] = []
     seen_families: set[str] = set()
 
@@ -280,9 +288,6 @@ def dedupe_chunks(chunks: list[dict[str, Any]], top_k: int) -> list[dict[str, An
 
 
 def candidate_pool_size(top_k: int) -> int:
-    """
-    Retrieve a larger ranked pool first, then dedupe down to final top_k.
-    """
     top_k = max(1, min(top_k, 20))
     return min(max(top_k * 6, 18), 80)
 
@@ -327,11 +332,8 @@ def graph_get_json(url: str, token: str) -> dict[str, Any]:
 
 
 def graph_get_bytes(url: str, token: str) -> bytes:
-    resp = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=120,
-    )
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.get(url, headers=headers, timeout=120)
     resp.raise_for_status()
     return resp.content
 
@@ -546,15 +548,26 @@ def upsert_file_chunks(cur, file_id: int, extracted_text: str) -> int:
     return len(chunks)
 
 
-def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+def _filtered_source_clause(source_types: list[str] | None) -> tuple[str, tuple[Any, ...]]:
+    if not source_types:
+        return "", tuple()
+    return " AND f.source_type = ANY(%s)", (source_types,)
+
+
+def search_similar_chunks_vector(
+    question: str,
+    top_k: int = 5,
+    source_types: list[str] | None = None,
+) -> list[dict[str, Any]]:
     top_k = max(1, min(top_k, 20))
     initial_limit = candidate_pool_size(top_k)
     question_embedding = vector_literal(embed_text(question))
+    source_clause, source_params = _filtered_source_clause(source_types)
 
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     f.id,
                     f.microsoft_file_id,
@@ -567,10 +580,11 @@ def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str
                 JOIN office365.files f
                   ON f.id = fc.file_id
                 WHERE fc.embedding IS NOT NULL
+                {source_clause}
                 ORDER BY fc.embedding <-> %s::vector
                 LIMIT %s
                 """,
-                (question_embedding, initial_limit),
+                (*source_params, question_embedding, initial_limit),
             )
             rows = cur.fetchall()
 
@@ -592,15 +606,20 @@ def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str
     return dedupe_chunks(results, top_k)
 
 
-def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+def search_similar_chunks_keyword(
+    question: str,
+    top_k: int = 5,
+    source_types: list[str] | None = None,
+) -> list[dict[str, Any]]:
     top_k = max(1, min(top_k, 20))
     initial_limit = candidate_pool_size(top_k)
     query = f"%{question.strip()}%"
+    source_clause, source_params = _filtered_source_clause(source_types)
 
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     f.id,
                     f.microsoft_file_id,
@@ -613,10 +632,11 @@ def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[st
                 JOIN office365.files f
                   ON f.id = fc.file_id
                 WHERE fc.content ILIKE %s
+                {source_clause}
                 ORDER BY f.updated_at DESC, fc.chunk_index ASC
                 LIMIT %s
                 """,
-                (query, initial_limit),
+                (query, *source_params, initial_limit),
             )
             rows = cur.fetchall()
 
@@ -638,77 +658,766 @@ def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[st
     return dedupe_chunks(results, top_k)
 
 
-def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]:
+def search_similar_chunks(
+    question: str,
+    top_k: int = 5,
+    source_types: list[str] | None = None,
+) -> list[dict[str, Any]]:
     try:
-        results = search_similar_chunks_vector(question, top_k)
+        results = search_similar_chunks_vector(question, top_k, source_types=source_types)
         if results:
             return results
     except Exception:
         pass
 
-    return search_similar_chunks_keyword(question, top_k)
+    return search_similar_chunks_keyword(question, top_k, source_types=source_types)
 
 
-def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
-    question = (question or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question is required")
+# --------------------------------------------------------------------
+# Routing and quality heuristics
+# --------------------------------------------------------------------
 
-    chunks = search_similar_chunks(question, top_k)
+def classify_question(question: str) -> str:
+    q = normalize_whitespace(question).lower()
 
+    if not q:
+        return "ambiguous"
+
+    developer_terms = [
+        " api", " graph", " endpoint", " sdk", " auth", " oauth", " token",
+        " schema", " extension", " manifest", " add-in", " add in", " developer",
+        " rest ", "http ", "json ", "permission scope", "webhook"
+    ]
+    admin_terms = [
+        " admin", " tenant", " policy", " policies", " compliance", " security",
+        " license", " licensing", " governance", " retention", " audit",
+        " configure", " enable", " disable", " org", " organization", " role",
+        " sharepoint admin", "teams admin", "entra", "exchange online powershell"
+    ]
+    teams_terms = [
+        "teams", "team ", "channel", "guest access", "external access",
+        "meeting", "chat", "lobby", "shared channel", "private channel"
+    ]
+    sharepoint_terms = [
+        "sharepoint", "onedrive", "site", "document library", "library",
+        "hub site", "page", "permissions", "sharing link", "browser idle sign out"
+    ]
+    copilot_terms = ["copilot", "agent", "grounding", "pay-as-you-go", "pay as you go"]
+    training_terms = [
+        "how do i", "how to", "steps", "walk me through", "where do i",
+        "click", "show me how", "create a", "add a", "set up my", "organize"
+    ]
+
+    if any(term in q for term in developer_terms):
+        return "developer"
+    if any(term in q for term in copilot_terms):
+        return "copilot"
+    if any(term in q for term in teams_terms):
+        return "teams"
+    if any(term in q for term in sharepoint_terms):
+        return "sharepoint"
+    if any(term in q for term in admin_terms):
+        return "admin"
+    if any(term in q for term in training_terms):
+        return "training"
+
+    return "ambiguous"
+
+
+def is_process_question(question: str) -> bool:
+    q = normalize_whitespace(question).lower()
+    process_markers = [
+        "how do i", "how to", "steps", "walk me through", "click", "set up",
+        "configure", "enable", "disable", "create", "add", "remove", "change",
+        "update", "turn on", "turn off"
+    ]
+    return any(marker in q for marker in process_markers)
+
+
+def search_similar_chunks_routed(question: str, top_k: int = 5) -> tuple[list[dict[str, Any]], str, list[str], bool]:
+    route = classify_question(question)
+    preferred_source_types = ROUTE_SOURCE_TYPES.get(route, [])
+
+    chunks: list[dict[str, Any]] = []
+    used_fallback = False
+
+    if preferred_source_types:
+        chunks = search_similar_chunks(question, top_k=top_k, source_types=preferred_source_types)
+
+    if len(chunks) < min(3, top_k):
+        fallback_chunks = search_similar_chunks(question, top_k=top_k, source_types=None)
+        if fallback_chunks:
+            chunks = fallback_chunks
+            used_fallback = bool(preferred_source_types)
+
+    return chunks, route, preferred_source_types, used_fallback
+
+
+def route_sources_match_user_intent(route: str, chunks: list[dict[str, Any]]) -> bool:
+    source_types = [str(c.get("source_type") or "").strip() for c in chunks]
+
+    if route == "training":
+        return any(s in {"outlook-training", "teams", "sharepoint"} for s in source_types)
+
+    if route == "developer":
+        return any(s in {"graph", "outlook-developer"} for s in source_types)
+
+    if route == "admin":
+        return any(s in {"m365-admin", "outlook-admin", "copilot"} for s in source_types)
+
+    if route == "teams":
+        return any(s == "teams" for s in source_types)
+
+    if route == "sharepoint":
+        return any(s == "sharepoint" for s in source_types)
+
+    if route == "copilot":
+        return any(s == "copilot" for s in source_types)
+
+    return True
+
+
+def assess_retrieval_quality(chunks: list[dict[str, Any]], route: str, used_fallback: bool) -> str:
     if not chunks:
-        return {
-            "answer": "I do not know based on the currently indexed documents.",
-            "sources": [],
-        }
+        return "none"
 
+    source_types = {str(chunk.get("source_type") or "").strip() for chunk in chunks if chunk.get("source_type")}
+    if len(chunks) < 2:
+        return "weak"
+
+    if route != "ambiguous":
+        preferred = set(ROUTE_SOURCE_TYPES.get(route, []))
+        if preferred and not any(source in preferred for source in source_types):
+            return "weak"
+
+    if used_fallback and len(source_types) >= 3:
+        return "mixed"
+
+    if len(source_types) >= 4:
+        return "mixed"
+
+    return "grounded"
+
+
+def chunks_are_summary_only(chunks: list[dict[str, Any]]) -> bool:
+    if not chunks:
+        return True
+
+    summary_markers = [
+        "learning objectives",
+        "module",
+        "modules",
+        "units",
+        "learning path",
+        "summary",
+        "overview",
+        "prerequisites",
+        "feedback beginner",
+        "this module is part of",
+    ]
+
+    summary_hits = 0
+    for chunk in chunks[:3]:
+        content = str(chunk.get("content") or "").lower()
+        if any(marker in content for marker in summary_markers):
+            summary_hits += 1
+
+    return summary_hits >= 2
+
+
+def chunks_have_step_support(chunks: list[dict[str, Any]]) -> bool:
+    if not chunks:
+        return False
+
+    step_markers = [
+        "1.",
+        "2.",
+        "step",
+        "select ",
+        "click ",
+        "open ",
+        "choose ",
+        "go to ",
+        "type ",
+        "save",
+        "signatures",
+        "settings",
+        "options",
+        "message tab",
+        "file,",
+    ]
+
+    for chunk in chunks[:3]:
+        content = str(chunk.get("content") or "").lower()
+        if sum(1 for marker in step_markers if marker in content) >= 2:
+            return True
+
+    return False
+
+
+def question_requires_web_fallback(question: str, chunks: list[dict[str, Any]], route: str, retrieval_quality: str) -> bool:
+    if retrieval_quality in {"none", "weak"}:
+        return True
+
+    q = normalize_whitespace(question).lower()
+    top_contents = " ".join(str(c.get("content") or "").lower() for c in chunks[:3])
+    top_titles = " ".join(str(c.get("name") or "").lower() for c in chunks[:3])
+
+    # Process questions need actual procedures, not just training summaries.
+    if is_process_question(question):
+        if chunks_are_summary_only(chunks):
+            return True
+        if not chunks_have_step_support(chunks):
+            return True
+
+    # Special case: user explicitly asks for Outlook on the web, but indexed corpus is about new Outlook for Windows.
+    if "outlook on the web" in q or "outlook web" in q or "outlook on web" in q:
+        if "new outlook for windows" in top_contents or "new outlook for windows" in top_titles:
+            return True
+
+    # Special case: if question is browser/web-specific but top chunks are desktop-oriented.
+    if "on the web" in q or "browser" in q:
+        desktop_markers = ["new outlook for windows", "windows", "desktop", "message tab"]
+        if any(marker in top_contents or marker in top_titles for marker in desktop_markers):
+            if not any("outlook on the web" in str(c.get("content") or "").lower() for c in chunks[:3]):
+                return True
+
+    # Process questions with generic training summaries should fall back.
+    if route == "training" and is_process_question(question):
+        generic_training_markers = ["create and manage signatures", "customize", "learning objectives"]
+        generic_hits = 0
+        for chunk in chunks[:3]:
+            content = str(chunk.get("content") or "").lower()
+            if any(marker in content for marker in generic_training_markers):
+                generic_hits += 1
+        if generic_hits >= 2 and not chunks_have_step_support(chunks):
+            return True
+
+    return False
+
+
+# --------------------------------------------------------------------
+# Prompt construction and answer repair
+# --------------------------------------------------------------------
+
+def build_context_text(chunks: list[dict[str, Any]]) -> str:
     context_parts = []
     for i, chunk in enumerate(chunks, start=1):
         context_parts.append(
-            f"[Source {i}] Source Type: {chunk.get('source_type', 'unknown')}\n"
+            f"[Indexed Source {i}] Source Type: {chunk.get('source_type', 'unknown')}\n"
             f"File: {chunk['name']}\n"
             f"URL: {chunk['web_url']}\n"
             f"Chunk Index: {chunk['chunk_index']}\n"
             f"Retrieval Mode: {chunk.get('retrieval_mode', 'unknown')}\n"
             f"Content:\n{chunk['content']}"
         )
+    return "\n\n---\n\n".join(context_parts)
 
-    context_text = "\n\n---\n\n".join(context_parts)
 
-    system_prompt = (
-        "You answer questions using only the provided Office365 retrieved context. "
-        "The context may come from multiple Office365 sources including Graph, Teams, "
-        "SharePoint, Copilot, and Microsoft 365 admin content. "
-        "If the answer is not supported by the context, say you do not know. "
-        "Do not assume SharePoint is the only source. "
-        "Prefer concise factual answers and include bullet points when asked to summarize."
+def build_system_prompt(question: str, route: str, retrieval_quality: str) -> str:
+    answer_mode = "process" if is_process_question(question) else "concept"
+
+    if retrieval_quality == "weak":
+        uncertainty_instruction = (
+            "Retrieval quality is weak. You must explicitly say that you cannot fully confirm the answer from the indexed Office365 sources."
+        )
+    elif retrieval_quality == "mixed":
+        uncertainty_instruction = (
+            "Retrieval quality is mixed. You must explicitly mention ambiguity, blended sourcing, or missing confirmation."
+        )
+    else:
+        uncertainty_instruction = (
+            "Retrieval quality is grounded. Answer directly but stay strictly within the evidence."
+        )
+
+    process_instruction = (
+        "This is a process-oriented question. Under 'Recommendation / next step', use a numbered list only if the retrieved context supports an ordered procedure. Do not use bullet points for ordered steps."
+        if answer_mode == "process"
+        else
+        "This is a concept-oriented question. Under 'Recommendation / next step', use bullet points, not numbered steps, unless the retrieved context clearly requires a sequence."
     )
 
-    user_prompt = f"""Question:
+    return f"""
+You are an Office365 consultant assistant.
+
+You must answer using ONLY the provided retrieved context.
+Do not use outside knowledge.
+Do not fill gaps with generic Microsoft product knowledge.
+If the context is insufficient, say so explicitly.
+
+Primary route: {route}
+Retrieval quality: {retrieval_quality}
+Answer mode: {answer_mode}
+
+You MUST output exactly these 5 sections in this exact order:
+
+Direct answer
+Key details
+Recommendation / next step
+Risks / limitations
+Source basis
+
+Formatting rules:
+- Direct answer:
+  Write 1 to 3 plain sentences only.
+  Do not use bullets.
+  Do not use numbering.
+- Key details:
+  Use bullet points only.
+  Include 2 to 5 bullets.
+- Recommendation / next step:
+  If the question is process-oriented and the context supports steps, use a numbered list only.
+  Otherwise use bullet points.
+- Risks / limitations:
+  Use bullet points only.
+- Source basis:
+  Use bullet points only.
+  Each bullet must be short.
+  Each bullet must use this format: source_type - file title
+  Do not include direct quotes.
+  Do not include copied sentences from the source text.
+  Do not include URLs.
+
+Hard rules:
+- Do not omit any section.
+- Do not rename any section.
+- Do not use bullets in Direct answer.
+- Do not use numbered steps unless the question is process-oriented and the context supports a sequence.
+- If the answer is not supported, say exactly: "I cannot confirm this from the indexed Office365 sources."
+
+Behavior rules:
+- Never imply certainty beyond the evidence.
+- Never invent UI paths, commands, or settings that are not supported in the context.
+- If the sources conflict or do not cleanly match the route, say so.
+- Prefer being too strict over being too speculative.
+- {process_instruction}
+- {uncertainty_instruction}
+""".strip()
+
+
+def build_user_prompt(question: str, context_text: str) -> str:
+    return f"""Question:
 {question}
 
 Context:
 {context_text}
 """
 
-    try:
-        client = get_openai_client()
-        resp = client.chat.completions.create(
+
+def build_repair_prompt(original_answer: str, question: str) -> str:
+    answer_mode = "process" if is_process_question(question) else "concept"
+    return f"""Rewrite the answer so it exactly follows the required format.
+Do not add new facts.
+Do not remove supported facts unless necessary to fix formatting.
+Keep the same meaning.
+Fix only section compliance and formatting.
+
+Question type: {answer_mode}
+
+Required sections in exact order:
+Direct answer
+Key details
+Recommendation / next step
+Risks / limitations
+Source basis
+
+Rules:
+- Direct answer must be 1 to 3 plain sentences only.
+- Direct answer must not contain bullets or numbering.
+- Key details must use bullets.
+- Risks / limitations must use bullets.
+- Source basis must use short bullets only.
+- Source basis bullets must use this exact format: source_type - file title
+- Source basis must not contain quotation marks.
+- Source basis must not contain copied source sentences.
+- Recommendation / next step must use numbered steps only for process questions and only if the answer already contains a supported procedure.
+
+Original answer:
+{original_answer}
+"""
+
+
+def extract_section_block(answer: str, section_name: str, next_section_name: str | None = None) -> str:
+    if next_section_name:
+        pattern = rf"{re.escape(section_name)}\s*(.*?)(?:\n\s*{re.escape(next_section_name)}\b)"
+    else:
+        pattern = rf"{re.escape(section_name)}\s*(.*)$"
+
+    match = re.search(pattern, answer, flags=re.DOTALL | re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def has_required_sections(answer: str) -> bool:
+    required = [
+        "Direct answer",
+        "Key details",
+        "Recommendation / next step",
+        "Risks / limitations",
+        "Source basis",
+    ]
+    return all(section in answer for section in required)
+
+
+def direct_answer_has_bullets(answer: str) -> bool:
+    block = extract_section_block(answer, "Direct answer", "Key details")
+    if not block:
+        return True
+
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    return any(line.startswith("-") or re.match(r"^\d+\.", line) for line in lines)
+
+
+def recommendation_has_numbered_steps(answer: str) -> bool:
+    block = extract_section_block(answer, "Recommendation / next step", "Risks / limitations")
+    if not block:
+        return False
+
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    return any(re.match(r"^\d+\.", line) for line in lines)
+
+
+def source_basis_needs_repair(answer: str) -> bool:
+    block = extract_section_block(answer, "Source basis", None)
+    if not block:
+        return True
+
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    bullet_lines = [line for line in lines if line.startswith("-")]
+    if not bullet_lines:
+        return True
+
+    for line in bullet_lines:
+        if '"' in line or "'" in line:
+            return True
+        if "http://" in line or "https://" in line:
+            return True
+        if "Source " in line:
+            return True
+        if len(line) > 180:
+            return True
+        body = line[1:].strip()
+        if " - " not in body:
+            return True
+
+    return False
+
+
+def answer_needs_repair(answer: str, question: str) -> bool:
+    if not has_required_sections(answer):
+        return True
+
+    if direct_answer_has_bullets(answer):
+        return True
+
+    if is_process_question(question):
+        if not recommendation_has_numbered_steps(answer):
+            return True
+
+    if source_basis_needs_repair(answer):
+        return True
+
+    return False
+
+
+def generate_indexed_answer_text(question: str, chunks: list[dict[str, Any]], route: str, retrieval_quality: str) -> str:
+    context_text = build_context_text(chunks)
+    system_prompt = build_system_prompt(question, route, retrieval_quality)
+    user_prompt = build_user_prompt(question, context_text)
+
+    client = get_openai_client()
+
+    resp = client.chat.completions.create(
+        model=get_chat_model(),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+    )
+
+    answer = (resp.choices[0].message.content or "").strip()
+
+    if answer_needs_repair(answer, question):
+        repair_prompt = build_repair_prompt(answer, question)
+        repair_resp = client.chat.completions.create(
             model=get_chat_model(),
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": repair_prompt},
             ],
-            temperature=0.2,
+            temperature=0.0,
         )
+        repaired = (repair_resp.choices[0].message.content or "").strip()
+        if repaired:
+            answer = repaired
+
+    return answer
+
+
+# --------------------------------------------------------------------
+# Web fallback
+# --------------------------------------------------------------------
+
+def build_web_fallback_input(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
+    indexed_context = build_context_text(chunks) if chunks else "No indexed context available."
+
+    return f"""
+You are an Office365 consultant assistant.
+
+Task:
+Answer the user's question using web search because the indexed Office365 corpus is weak, incomplete, missing, stale, or not sufficiently procedural.
+
+Source priority:
+1. Use indexed Office365 context first if it is materially helpful.
+2. Use live web search to fill missing or current product details.
+3. Prefer official Microsoft sources:
+   - learn.microsoft.com
+   - support.microsoft.com
+   - microsoft.com
+   - techcommunity.microsoft.com only when necessary
+4. Do not rely on unstated background knowledge if indexed and web sources do not support the answer.
+
+Question route: {route}
+Indexed retrieval quality: {retrieval_quality}
+
+Formatting rules:
+You MUST output exactly these 5 sections in this exact order:
+
+Direct answer
+Key details
+Recommendation / next step
+Risks / limitations
+Source basis
+
+Additional formatting rules:
+- Direct answer: 1 to 3 plain sentences only, no bullets, no numbering.
+- Key details: bullet points only.
+- Recommendation / next step:
+  - numbered steps only for process questions
+  - bullet points otherwise
+- Risks / limitations: bullet points only.
+- Source basis:
+  - bullet points only
+  - short entries only
+  - use this format:
+    - web - source title
+    - indexed - file title
+  - do not include raw URLs
+  - do not include quotation marks
+  - do not copy long source text verbatim
+
+Question:
+{question}
+
+Indexed Office365 context:
+{indexed_context}
+""".strip()
+
+
+def run_openai_web_fallback(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
+    client = get_web_fallback_client()
+    model = get_web_fallback_model()
+    prompt = build_web_fallback_input(question, route, retrieval_quality, chunks)
+
+    resp = client.responses.create(
+        model=model,
+        tools=[{"type": "web_search"}],
+        input=prompt,
+    )
+
+    output_text = (getattr(resp, "output_text", None) or "").strip()
+    if not output_text:
+        raise RuntimeError("Web fallback returned empty output_text")
+
+    return output_text
+
+
+def run_web_fallback(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
+    provider = get_web_fallback_provider()
+
+    if provider != "openai":
+        raise RuntimeError(f"Unsupported WEB_FALLBACK_PROVIDER: {provider}")
+
+    return run_openai_web_fallback(question, route, retrieval_quality, chunks)
+
+
+def build_weak_training_answer(chunks: list[dict[str, Any]]) -> str:
+    source_lines = []
+    for chunk in chunks[:3]:
+        source_type = str(chunk.get("source_type") or "unknown").strip()
+        name = str(chunk.get("name") or "Untitled").strip()
+        source_lines.append(f"- {source_type} - {name}")
+
+    if not source_lines:
+        source_lines.append("- none - no supporting sources were retrieved")
+
+    return (
+        "Direct answer\n"
+        "I cannot confirm the end-user Outlook steps from the indexed Office365 sources.\n\n"
+        "Key details\n"
+        "- The current retrieved results are developer, admin, or summary-level training content rather than concrete user interface steps.\n"
+        "- Answering with click-by-click Outlook steps here would require unsupported assumptions.\n\n"
+        "Recommendation / next step\n"
+        "1. Add end-user Outlook documentation with concrete procedures to the training corpus.\n"
+        "2. Re-ask after the training source is indexed.\n\n"
+        "Risks / limitations\n"
+        "- The current corpus appears to contain related signature material, but not the user-facing steps needed for a reliable training answer.\n"
+        "- A more specific answer would risk mixing summary content with unsupported assumptions.\n\n"
+        "Source basis\n"
+        + "\n".join(source_lines)
+    )
+
+
+# --------------------------------------------------------------------
+# Answer flow
+# --------------------------------------------------------------------
+
+def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
+    question = (question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    chunks, route, preferred_source_types, used_fallback = search_similar_chunks_routed(question, top_k)
+
+    if not chunks:
+        retrieval_quality = "none"
+
+        if get_web_fallback_enabled():
+            try:
+                web_answer = run_web_fallback(question, route, retrieval_quality, [])
+                return {
+                    "answer": web_answer,
+                    "sources": [],
+                    "route": route,
+                    "preferred_source_types": preferred_source_types,
+                    "retrieval_quality": retrieval_quality,
+                    "used_fallback": used_fallback,
+                    "answer_origin": "web_fallback",
+                }
+            except Exception as exc:
+                return {
+                    "answer": (
+                        "Direct answer\n"
+                        "I cannot confirm this from the indexed Office365 sources, and web fallback also failed.\n\n"
+                        "Key details\n"
+                        f"- Web fallback error: {exc}\n"
+                        "- No relevant indexed context was returned.\n\n"
+                        "Recommendation / next step\n"
+                        "1. Verify WEB_FALLBACK environment variables.\n"
+                        "2. Retry the question after confirming API access.\n\n"
+                        "Risks / limitations\n"
+                        "- No supporting indexed evidence was found.\n"
+                        "- Web fallback did not complete successfully.\n\n"
+                        "Source basis\n"
+                        "- none - no supporting sources were retrieved"
+                    ),
+                    "sources": [],
+                    "route": route,
+                    "preferred_source_types": preferred_source_types,
+                    "retrieval_quality": retrieval_quality,
+                    "used_fallback": used_fallback,
+                    "answer_origin": "fallback_error",
+                }
+
+        return {
+            "answer": (
+                "Direct answer\n"
+                "I cannot confirm this from the indexed Office365 sources.\n\n"
+                "Key details\n"
+                "- No relevant retrieved context was returned.\n"
+                "- The current index did not provide supporting evidence for this question.\n\n"
+                "Recommendation / next step\n"
+                "1. Add or refresh documentation for this topic in the indexed corpus.\n"
+                "2. Retry the question with more specific product or admin terms.\n\n"
+                "Risks / limitations\n"
+                "- The current index did not return supporting evidence.\n"
+                "- Any stronger answer would require unsupported assumptions.\n\n"
+                "Source basis\n"
+                "- none - no supporting sources were retrieved"
+            ),
+            "sources": [],
+            "route": route,
+            "preferred_source_types": preferred_source_types,
+            "retrieval_quality": retrieval_quality,
+            "used_fallback": used_fallback,
+            "answer_origin": "indexed_only",
+        }
+
+    retrieval_quality = assess_retrieval_quality(chunks, route, used_fallback)
+
+    if not route_sources_match_user_intent(route, chunks):
+        retrieval_quality = "weak"
+
+    if question_requires_web_fallback(question, chunks, route, retrieval_quality):
+        retrieval_quality = "weak"
+
+    if route == "training" and retrieval_quality == "weak" and not get_web_fallback_enabled():
+        return {
+            "answer": build_weak_training_answer(chunks),
+            "sources": chunks,
+            "route": route,
+            "preferred_source_types": preferred_source_types,
+            "retrieval_quality": retrieval_quality,
+            "used_fallback": used_fallback,
+            "answer_origin": "indexed_only",
+        }
+
+    if retrieval_quality in {"weak", "none"} and get_web_fallback_enabled():
+        try:
+            web_answer = run_web_fallback(question, route, retrieval_quality, chunks)
+            return {
+                "answer": web_answer,
+                "sources": chunks,
+                "route": route,
+                "preferred_source_types": preferred_source_types,
+                "retrieval_quality": retrieval_quality,
+                "used_fallback": used_fallback,
+                "answer_origin": "web_fallback",
+            }
+        except Exception as exc:
+            if route == "training":
+                fallback_answer = build_weak_training_answer(chunks)
+                fallback_answer = fallback_answer.strip() + f"\n- Web fallback failed: {exc}"
+                return {
+                    "answer": fallback_answer,
+                    "sources": chunks,
+                    "route": route,
+                    "preferred_source_types": preferred_source_types,
+                    "retrieval_quality": retrieval_quality,
+                    "used_fallback": used_fallback,
+                    "answer_origin": "fallback_error_then_indexed",
+                }
+
+            indexed_answer = generate_indexed_answer_text(question, chunks, route, retrieval_quality)
+            indexed_answer = indexed_answer.strip() + f"\n\nRisks / limitations\n- Web fallback failed: {exc}\n"
+            return {
+                "answer": indexed_answer,
+                "sources": chunks,
+                "route": route,
+                "preferred_source_types": preferred_source_types,
+                "retrieval_quality": retrieval_quality,
+                "used_fallback": used_fallback,
+                "answer_origin": "fallback_error_then_indexed",
+            }
+
+    try:
+        answer = generate_indexed_answer_text(question, chunks, route, retrieval_quality)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"OpenAI chat failed: {exc}") from exc
-
-    answer = resp.choices[0].message.content or ""
 
     return {
         "answer": answer,
         "sources": chunks,
+        "route": route,
+        "preferred_source_types": preferred_source_types,
+        "retrieval_quality": retrieval_quality,
+        "used_fallback": used_fallback,
+        "answer_origin": "indexed_only",
     }
 
 
@@ -723,7 +1432,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "office365-brain-api"}
+    return {
+        "ok": True,
+        "service": "office365-brain-api",
+        "web_fallback_enabled": get_web_fallback_enabled(),
+        "web_fallback_provider": get_web_fallback_provider(),
+        "web_fallback_model": get_web_fallback_model() if get_web_fallback_enabled() else None,
+    }
 
 
 @app.get("/files")
