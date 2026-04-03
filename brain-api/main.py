@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import psycopg
 import requests
@@ -170,6 +171,120 @@ def extract_user_question_from_messages(messages: list[OpenAIChatMessage]) -> st
         return str(content).strip()
 
     return ""
+
+
+# --------------------------------------------------------------------
+# Retrieval deduplication helpers
+# --------------------------------------------------------------------
+
+def normalize_whitespace(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_title(title: str | None) -> str:
+    """
+    Create a stable title key for doc-family dedupe.
+    """
+    value = normalize_whitespace(title).lower()
+
+    # remove common site suffixes/prefixes that create noisy variants
+    value = re.sub(r"\s*\|\s*microsoft learn\s*$", "", value)
+    value = re.sub(r"\s*-\s*microsoft graph\s*\|\s*microsoft learn\s*$", "", value)
+    value = re.sub(r"\s*-\s*microsoft teams\s*\|\s*microsoft learn\s*$", "", value)
+    value = re.sub(r"\s*-\s*microsoft 365 copilot connectors\s*\|\s*microsoft learn\s*$", "", value)
+
+    # collapse punctuation spacing
+    value = re.sub(r"[\|\-–—:]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def canonicalize_url(url: str | None) -> str:
+    """
+    Canonicalize URL aggressively enough to collapse common Learn variants:
+    - removes query string and fragment
+    - lowercases host/path
+    - removes trailing slash
+    - collapses duplicate slashes
+    """
+    if not url:
+        return ""
+
+    try:
+        parsed = urlparse(url.strip())
+        scheme = (parsed.scheme or "https").lower()
+        netloc = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+
+        path = re.sub(r"/+", "/", path)
+        if path.endswith("/") and path != "/":
+            path = path[:-1]
+
+        return f"{scheme}://{netloc}{path}"
+    except Exception:
+        value = url.strip().lower()
+        value = value.split("#", 1)[0]
+        value = value.split("?", 1)[0]
+        value = re.sub(r"/+", "/", value)
+        if value.endswith("/") and not value.endswith("://"):
+            value = value[:-1]
+        return value
+
+
+def doc_family_key(chunk: dict[str, Any]) -> str:
+    """
+    Prefer canonical URL family. Fall back to normalized title.
+    This is intentionally stronger than file-id-only dedupe.
+    """
+    canonical_url = canonicalize_url(chunk.get("web_url"))
+    normalized_title = normalize_title(chunk.get("name"))
+    microsoft_file_id = (chunk.get("microsoft_file_id") or "").strip()
+
+    # Best key: canonical URL path
+    if canonical_url:
+        return f"url:{canonical_url}"
+
+    # Next best: normalized title
+    if normalized_title:
+        return f"title:{normalized_title}"
+
+    # Fallbacks
+    if microsoft_file_id:
+        return f"id:{microsoft_file_id}"
+
+    return f"fallback:{chunk.get('file_id')}:{chunk.get('chunk_index')}"
+
+
+def dedupe_chunks(chunks: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+    """
+    Keep only the first/best-ranked chunk per document family.
+    Input order is already ranked by retrieval, so earlier wins.
+    """
+    deduped: list[dict[str, Any]] = []
+    seen_families: set[str] = set()
+
+    for chunk in chunks:
+        family_key = doc_family_key(chunk)
+        if family_key in seen_families:
+            continue
+
+        seen_families.add(family_key)
+        deduped.append(chunk)
+
+        if len(deduped) >= top_k:
+            break
+
+    return deduped
+
+
+def candidate_pool_size(top_k: int) -> int:
+    """
+    Retrieve a larger ranked pool first, then dedupe down to final top_k.
+    """
+    top_k = max(1, min(top_k, 20))
+    return min(max(top_k * 6, 18), 80)
 
 
 # --------------------------------------------------------------------
@@ -433,6 +548,7 @@ def upsert_file_chunks(cur, file_id: int, extracted_text: str) -> int:
 
 def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str, Any]]:
     top_k = max(1, min(top_k, 20))
+    initial_limit = candidate_pool_size(top_k)
     question_embedding = vector_literal(embed_text(question))
 
     with get_db_conn() as conn:
@@ -442,6 +558,7 @@ def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str
                 SELECT
                     f.id,
                     f.microsoft_file_id,
+                    f.source_type,
                     f.name,
                     f.web_url,
                     fc.chunk_index,
@@ -453,7 +570,7 @@ def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str
                 ORDER BY fc.embedding <-> %s::vector
                 LIMIT %s
                 """,
-                (question_embedding, top_k),
+                (question_embedding, initial_limit),
             )
             rows = cur.fetchall()
 
@@ -463,18 +580,21 @@ def search_similar_chunks_vector(question: str, top_k: int = 5) -> list[dict[str
             {
                 "file_id": row[0],
                 "microsoft_file_id": row[1],
-                "name": row[2],
-                "web_url": row[3],
-                "chunk_index": row[4],
-                "content": row[5],
+                "source_type": row[2],
+                "name": row[3],
+                "web_url": row[4],
+                "chunk_index": row[5],
+                "content": row[6],
                 "retrieval_mode": "vector",
             }
         )
-    return results
+
+    return dedupe_chunks(results, top_k)
 
 
 def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[str, Any]]:
     top_k = max(1, min(top_k, 20))
+    initial_limit = candidate_pool_size(top_k)
     query = f"%{question.strip()}%"
 
     with get_db_conn() as conn:
@@ -484,6 +604,7 @@ def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[st
                 SELECT
                     f.id,
                     f.microsoft_file_id,
+                    f.source_type,
                     f.name,
                     f.web_url,
                     fc.chunk_index,
@@ -495,7 +616,7 @@ def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[st
                 ORDER BY f.updated_at DESC, fc.chunk_index ASC
                 LIMIT %s
                 """,
-                (query, top_k),
+                (query, initial_limit),
             )
             rows = cur.fetchall()
 
@@ -505,14 +626,16 @@ def search_similar_chunks_keyword(question: str, top_k: int = 5) -> list[dict[st
             {
                 "file_id": row[0],
                 "microsoft_file_id": row[1],
-                "name": row[2],
-                "web_url": row[3],
-                "chunk_index": row[4],
-                "content": row[5],
+                "source_type": row[2],
+                "name": row[3],
+                "web_url": row[4],
+                "chunk_index": row[5],
+                "content": row[6],
                 "retrieval_mode": "keyword",
             }
         )
-    return results
+
+    return dedupe_chunks(results, top_k)
 
 
 def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]:
@@ -521,7 +644,6 @@ def search_similar_chunks(question: str, top_k: int = 5) -> list[dict[str, Any]]
         if results:
             return results
     except Exception:
-        # Fall through to keyword search
         pass
 
     return search_similar_chunks_keyword(question, top_k)
@@ -543,7 +665,8 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
     context_parts = []
     for i, chunk in enumerate(chunks, start=1):
         context_parts.append(
-            f"[Source {i}] File: {chunk['name']}\n"
+            f"[Source {i}] Source Type: {chunk.get('source_type', 'unknown')}\n"
+            f"File: {chunk['name']}\n"
             f"URL: {chunk['web_url']}\n"
             f"Chunk Index: {chunk['chunk_index']}\n"
             f"Retrieval Mode: {chunk.get('retrieval_mode', 'unknown')}\n"
@@ -553,8 +676,11 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
     context_text = "\n\n---\n\n".join(context_parts)
 
     system_prompt = (
-        "You answer questions using only the provided SharePoint document context. "
+        "You answer questions using only the provided Office365 retrieved context. "
+        "The context may come from multiple Office365 sources including Graph, Teams, "
+        "SharePoint, Copilot, and Microsoft 365 admin content. "
         "If the answer is not supported by the context, say you do not know. "
+        "Do not assume SharePoint is the only source. "
         "Prefer concise factual answers and include bullet points when asked to summarize."
     )
 
@@ -610,6 +736,7 @@ def list_files(limit: int = 100):
                 """
                 SELECT
                     microsoft_file_id,
+                    source_type,
                     name,
                     web_url,
                     mime_type,
@@ -628,11 +755,12 @@ def list_files(limit: int = 100):
         files.append(
             {
                 "microsoft_file_id": row[0],
-                "name": row[1],
-                "web_url": row[2],
-                "mime_type": row[3],
-                "last_modified_at": row[4].isoformat() if row[4] else None,
-                "updated_at": row[5].isoformat() if row[5] else None,
+                "source_type": row[1],
+                "name": row[2],
+                "web_url": row[3],
+                "mime_type": row[4],
+                "last_modified_at": row[5].isoformat() if row[5] else None,
+                "updated_at": row[6].isoformat() if row[6] else None,
             }
         )
 
@@ -649,6 +777,7 @@ def list_file_chunks(limit: int = 100):
                 """
                 SELECT
                     f.microsoft_file_id,
+                    f.source_type,
                     f.name,
                     f.web_url,
                     fc.chunk_index,
@@ -669,11 +798,12 @@ def list_file_chunks(limit: int = 100):
         chunks.append(
             {
                 "microsoft_file_id": row[0],
-                "name": row[1],
-                "web_url": row[2],
-                "chunk_index": row[3],
-                "content": row[4],
-                "embedding": row[5],
+                "source_type": row[1],
+                "name": row[2],
+                "web_url": row[3],
+                "chunk_index": row[4],
+                "content": row[5],
+                "embedding": row[6],
             }
         )
 
