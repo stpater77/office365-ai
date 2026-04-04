@@ -3,7 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import psycopg
 import requests
@@ -38,6 +38,14 @@ ROUTE_SOURCE_TYPES: dict[str, list[str]] = {
     "copilot": ["copilot"],
     "ambiguous": [],
 }
+
+OFFICIAL_WEB_DOMAINS = [
+    "learn.microsoft.com",
+    "support.microsoft.com",
+    "www.microsoft.com",
+    "microsoft.com",
+    "techcommunity.microsoft.com",
+]
 
 
 # --------------------------------------------------------------------
@@ -122,14 +130,29 @@ def get_web_fallback_enabled() -> bool:
 
 
 def get_web_fallback_provider() -> str:
-    return (os.getenv("WEB_FALLBACK_PROVIDER") or "openai").strip().lower()
+    return (os.getenv("WEB_FALLBACK_PROVIDER") or "ollama").strip().lower()
 
 
 def get_web_fallback_model() -> str:
-    return os.getenv("WEB_FALLBACK_CHAT_MODEL") or "gpt-5.4"
+    return os.getenv("WEB_FALLBACK_CHAT_MODEL") or "gpt-oss:120b-cloud"
 
 
 def get_web_fallback_client() -> OpenAI:
+    provider = get_web_fallback_provider()
+
+    if provider == "ollama":
+        api_key = (
+            os.getenv("WEB_FALLBACK_API_KEY")
+            or os.getenv("OLLAMA_API_KEY")
+            or "ollama"
+        )
+        base_url = (
+            os.getenv("WEB_FALLBACK_BASE_URL")
+            or os.getenv("OLLAMA_BASE_URL")
+            or "http://localhost:11434/v1"
+        )
+        return OpenAI(api_key=api_key, base_url=base_url)
+
     api_key = os.getenv("WEB_FALLBACK_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing WEB_FALLBACK_API_KEY and OPENAI_API_KEY")
@@ -139,6 +162,34 @@ def get_web_fallback_client() -> OpenAI:
         return OpenAI(api_key=api_key, base_url=base_url)
 
     return OpenAI(api_key=api_key)
+
+
+def get_ollama_auth_key() -> str:
+    api_key = os.getenv("WEB_FALLBACK_API_KEY") or os.getenv("OLLAMA_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing WEB_FALLBACK_API_KEY and OLLAMA_API_KEY for Ollama fallback")
+    return api_key
+
+
+def get_ollama_openai_base_url() -> str:
+    return (
+        os.getenv("WEB_FALLBACK_BASE_URL")
+        or os.getenv("OLLAMA_BASE_URL")
+        or "http://localhost:11434/v1"
+    ).rstrip("/")
+
+
+def get_ollama_api_base_url() -> str:
+    base_url = get_ollama_openai_base_url()
+    parsed = urlparse(base_url)
+    path = (parsed.path or "").rstrip("/")
+
+    if path.endswith("/v1"):
+        path = path[:-3]
+    if not path.endswith("/api"):
+        path = f"{path}/api" if path else "/api"
+
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", "")).rstrip("/")
 
 
 def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> list[str]:
@@ -863,26 +914,22 @@ def question_requires_web_fallback(question: str, chunks: list[dict[str, Any]], 
     top_contents = " ".join(str(c.get("content") or "").lower() for c in chunks[:3])
     top_titles = " ".join(str(c.get("name") or "").lower() for c in chunks[:3])
 
-    # Process questions need actual procedures, not just training summaries.
     if is_process_question(question):
         if chunks_are_summary_only(chunks):
             return True
         if not chunks_have_step_support(chunks):
             return True
 
-    # Special case: user explicitly asks for Outlook on the web, but indexed corpus is about new Outlook for Windows.
     if "outlook on the web" in q or "outlook web" in q or "outlook on web" in q:
         if "new outlook for windows" in top_contents or "new outlook for windows" in top_titles:
             return True
 
-    # Special case: if question is browser/web-specific but top chunks are desktop-oriented.
     if "on the web" in q or "browser" in q:
         desktop_markers = ["new outlook for windows", "windows", "desktop", "message tab"]
         if any(marker in top_contents or marker in top_titles for marker in desktop_markers):
             if not any("outlook on the web" in str(c.get("content") or "").lower() for c in chunks[:3]):
                 return True
 
-    # Process questions with generic training summaries should fall back.
     if route == "training" and is_process_question(question):
         generic_training_markers = ["create and manage signatures", "customize", "learning objectives"]
         generic_hits = 0
@@ -983,7 +1030,7 @@ Hard rules:
 - Do not rename any section.
 - Do not use bullets in Direct answer.
 - Do not use numbered steps unless the question is process-oriented and the context supports a sequence.
-- If the answer is not supported, say exactly: "I cannot confirm this from the indexed Office365 sources."
+- If the answer is not supported, say exactly: \"I cannot confirm this from the indexed Office365 sources.\"
 
 Behavior rules:
 - Never imply certainty beyond the evidence.
@@ -1163,10 +1210,178 @@ def generate_indexed_answer_text(question: str, chunks: list[dict[str, Any]], ro
 # Web fallback
 # --------------------------------------------------------------------
 
-def build_web_fallback_input(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
+def sanitize_web_query(question: str, route: str) -> str:
+    cleaned = normalize_whitespace(question)
+    if route == "admin":
+        return f"Microsoft 365 admin {cleaned}"
+    if route == "developer":
+        return f"Microsoft Graph developer {cleaned}"
+    if route == "teams":
+        return f"Microsoft Teams {cleaned}"
+    if route == "sharepoint":
+        return f"SharePoint Online {cleaned}"
+    if route == "copilot":
+        return f"Microsoft 365 Copilot {cleaned}"
+    if route == "training":
+        return f"Microsoft 365 how to {cleaned}"
+    return f"Microsoft 365 {cleaned}"
+
+
+def filter_official_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    official: list[dict[str, Any]] = []
+    other: list[dict[str, Any]] = []
+
+    for result in results:
+        url = str(result.get("url") or "")
+        netloc = urlparse(url).netloc.lower()
+        if any(netloc == domain or netloc.endswith(f".{domain}") for domain in OFFICIAL_WEB_DOMAINS):
+            official.append(result)
+        else:
+            other.append(result)
+
+    return official if official else other
+
+
+def ollama_web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
+    api_key = get_ollama_auth_key()
+    api_base = get_ollama_api_base_url()
+
+    resp = requests.post(
+        f"{api_base}/web_search",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "query": query,
+            "max_results": max(1, min(max_results, 10)),
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload.get("results", []) or []
+
+
+def ollama_web_fetch(url: str) -> dict[str, Any]:
+    api_key = get_ollama_auth_key()
+    api_base = get_ollama_api_base_url()
+
+    resp = requests.post(
+        f"{api_base}/web_fetch",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={"url": url},
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_ollama_web_context(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    query = sanitize_web_query(question, route)
+    search_results = ollama_web_search(query, max_results=5)
+    ranked_results = filter_official_results(search_results)[:3]
+
+    fetched_pages: list[dict[str, Any]] = []
+    for result in ranked_results:
+        url = str(result.get("url") or "").strip()
+        if not url:
+            continue
+        try:
+            page = ollama_web_fetch(url)
+            fetched_pages.append(
+                {
+                    "title": page.get("title") or result.get("title") or url,
+                    "url": url,
+                    "content": str(page.get("content") or "")[:12000],
+                    "snippet": result.get("content") or "",
+                }
+            )
+        except Exception:
+            fetched_pages.append(
+                {
+                    "title": result.get("title") or url,
+                    "url": url,
+                    "content": str(result.get("content") or "")[:4000],
+                    "snippet": result.get("content") or "",
+                }
+            )
+
     indexed_context = build_context_text(chunks) if chunks else "No indexed context available."
 
-    return f"""
+    web_blocks: list[str] = []
+    for i, page in enumerate(fetched_pages, start=1):
+        web_blocks.append(
+            f"[Web Source {i}]\n"
+            f"Title: {page['title']}\n"
+            f"URL: {page['url']}\n"
+            f"Snippet: {page['snippet']}\n"
+            f"Content:\n{page['content']}"
+        )
+
+    web_context = "\n\n---\n\n".join(web_blocks) if web_blocks else "No web results available."
+
+    prompt = f"""
+You are an Office365 consultant assistant.
+
+Task:
+Answer the user's question using indexed Office365 context first when useful, then current web evidence gathered from Ollama web search and Ollama web fetch.
+
+Rules:
+- Prefer Microsoft official sources when available.
+- Do not claim certainty beyond the evidence.
+- If web evidence is missing or conflicting, say so explicitly.
+- Do not invent UI paths, policies, or capabilities.
+- Treat indexed context as internal supporting evidence and web context as current external evidence.
+
+Question route: {route}
+Indexed retrieval quality: {retrieval_quality}
+
+You MUST output exactly these 5 sections in this exact order:
+
+Direct answer
+Key details
+Recommendation / next step
+Risks / limitations
+Source basis
+
+Formatting rules:
+- Direct answer: 1 to 3 plain sentences only, no bullets, no numbering.
+- Key details: bullet points only.
+- Recommendation / next step:
+  - numbered steps only for process questions
+  - bullet points otherwise
+- Risks / limitations: bullet points only.
+- Source basis:
+  - bullet points only
+  - short entries only
+  - use this format:
+    - web - source title
+    - indexed - file title
+  - do not include raw URLs
+  - do not include quotation marks
+  - do not copy long source text verbatim
+
+Question:
+{question}
+
+Indexed Office365 context:
+{indexed_context}
+
+Web context:
+{web_context}
+""".strip()
+
+    return prompt, fetched_pages
+
+
+def run_openai_web_fallback(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
+    client = get_web_fallback_client()
+    model = get_web_fallback_model()
+    prompt = f"""
 You are an Office365 consultant assistant.
 
 Task:
@@ -1215,14 +1430,8 @@ Question:
 {question}
 
 Indexed Office365 context:
-{indexed_context}
+{build_context_text(chunks) if chunks else 'No indexed context available.'}
 """.strip()
-
-
-def run_openai_web_fallback(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
-    client = get_web_fallback_client()
-    model = get_web_fallback_model()
-    prompt = build_web_fallback_input(question, route, retrieval_quality, chunks)
 
     resp = client.responses.create(
         model=model,
@@ -1237,13 +1446,47 @@ def run_openai_web_fallback(question: str, route: str, retrieval_quality: str, c
     return output_text
 
 
+def run_ollama_web_fallback(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
+    client = get_web_fallback_client()
+    model = get_web_fallback_model()
+    prompt, fetched_pages = build_ollama_web_context(question, route, retrieval_quality, chunks)
+
+    if not fetched_pages:
+        raise RuntimeError("Ollama web search returned no usable results")
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an Office365 consultant assistant. "
+                    "Use the provided indexed context and fetched web context only. "
+                    "Do not invent facts. Follow the formatting rules exactly."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+
+    output_text = (resp.choices[0].message.content or "").strip()
+    if not output_text:
+        raise RuntimeError("Ollama fallback returned empty content")
+
+    return output_text
+
+
 def run_web_fallback(question: str, route: str, retrieval_quality: str, chunks: list[dict[str, Any]]) -> str:
     provider = get_web_fallback_provider()
 
-    if provider != "openai":
-        raise RuntimeError(f"Unsupported WEB_FALLBACK_PROVIDER: {provider}")
+    if provider == "openai":
+        return run_openai_web_fallback(question, route, retrieval_quality, chunks)
 
-    return run_openai_web_fallback(question, route, retrieval_quality, chunks)
+    if provider == "ollama":
+        return run_ollama_web_fallback(question, route, retrieval_quality, chunks)
+
+    raise RuntimeError(f"Unsupported WEB_FALLBACK_PROVIDER: {provider}")
 
 
 def build_weak_training_answer(chunks: list[dict[str, Any]]) -> str:
@@ -1438,6 +1681,7 @@ def health():
         "web_fallback_enabled": get_web_fallback_enabled(),
         "web_fallback_provider": get_web_fallback_provider(),
         "web_fallback_model": get_web_fallback_model() if get_web_fallback_enabled() else None,
+        "ollama_api_base_url": get_ollama_api_base_url() if get_web_fallback_enabled() and get_web_fallback_provider() == "ollama" else None,
     }
 
 
