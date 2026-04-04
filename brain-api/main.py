@@ -335,7 +335,7 @@ def dedupe_chunks(chunks: list[dict[str, Any]], top_k: int) -> list[dict[str, An
         if len(deduped) >= top_k:
             break
 
-    return deduped
+    return dedupe_chunks(results, top_k)
 
 
 def candidate_pool_size(top_k: int) -> int:
@@ -1030,7 +1030,7 @@ Hard rules:
 - Do not rename any section.
 - Do not use bullets in Direct answer.
 - Do not use numbered steps unless the question is process-oriented and the context supports a sequence.
-- If the answer is not supported, say exactly: \"I cannot confirm this from the indexed Office365 sources.\"
+- If the answer is not supported, say exactly: "I cannot confirm this from the indexed Office365 sources."
 
 Behavior rules:
 - Never imply certainty beyond the evidence.
@@ -1881,6 +1881,14 @@ def v1_chat_completions(req: OpenAIChatRequest):
 
     result = answer_question(question, top_k=top_k)
     answer = result["answer"]
+
+    if result.get("answer_origin") == "web_fallback":
+        answer = (
+            answer.rstrip()
+            + f"\n\n[debug] answer_origin=web_fallback "
+              f"fallback_provider={get_web_fallback_provider()} "
+              f"fallback_model={get_web_fallback_model()}"
+        )
 
     created = int(utcnow().timestamp())
 
