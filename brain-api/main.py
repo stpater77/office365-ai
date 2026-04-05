@@ -1076,6 +1076,27 @@ def should_force_web_fallback_for_product_mismatch(question: str, chunks: list[d
     return not retrieved_chunks_match_product(requested_product, chunks)
 
 
+def indexed_answer_indicates_missing_support(answer: str) -> bool:
+    normalized = normalize_whitespace(answer).lower()
+    if not normalized:
+        return True
+
+    low_confidence_markers = [
+        "i cannot confirm this from the indexed office365 sources",
+        "the current index did not provide supporting evidence",
+        "no relevant retrieved context was returned",
+        "none of the indexed content describes",
+        "would require unsupported assumptions",
+        "the current context does not cleanly match the question",
+        "not present in the provided sources",
+        "not supported in the context",
+        "not in my database",
+        "i don't know",
+        "not available",
+    ]
+    return any(marker in normalized for marker in low_confidence_markers)
+
+
 # --------------------------------------------------------------------
 # Prompt construction and answer repair
 # --------------------------------------------------------------------
@@ -1466,8 +1487,8 @@ Answer the user's question using indexed Office365 context first when useful, th
 Rules:
 - Prefer Microsoft official sources when available.
 - Do not claim certainty beyond the evidence.
-- If web evidence is missing or conflicting, say so explicitly.
 - Do not invent UI paths, policies, or capabilities.
+- If web evidence is missing or conflicting, say so explicitly.
 - Treat indexed context as internal supporting evidence and web context as current external evidence.
 
 Question route: {route}
@@ -1746,7 +1767,7 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
             "answer_origin": "indexed_only",
         }
 
-    if retrieval_quality in {"weak", "none"} and get_web_fallback_enabled():
+    if retrieval_quality in {"weak", "none", "mixed"} and get_web_fallback_enabled():
         try:
             web_answer = run_web_fallback(question, route, retrieval_quality, chunks)
             return {
@@ -1788,6 +1809,21 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
         answer = generate_indexed_answer_text(question, chunks, route, retrieval_quality)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"OpenAI chat failed: {exc}") from exc
+
+    if get_web_fallback_enabled() and indexed_answer_indicates_missing_support(answer):
+        try:
+            web_answer = run_web_fallback(question, route, "weak", chunks)
+            return {
+                "answer": web_answer,
+                "sources": chunks,
+                "route": route,
+                "preferred_source_types": preferred_source_types,
+                "retrieval_quality": "weak",
+                "used_fallback": used_fallback,
+                "answer_origin": "web_fallback_after_low_confidence_indexed",
+            }
+        except Exception:
+            pass
 
     return {
         "answer": answer,
@@ -2036,3 +2072,4 @@ def v1_chat_completions(req: OpenAIChatRequest):
             }
         ],
     }
+}
