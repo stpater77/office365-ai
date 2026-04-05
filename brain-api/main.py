@@ -2072,4 +2072,3 @@ def v1_chat_completions(req: OpenAIChatRequest):
             }
         ],
     }
-}
