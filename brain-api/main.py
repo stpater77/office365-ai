@@ -943,6 +943,139 @@ def question_requires_web_fallback(question: str, chunks: list[dict[str, Any]], 
     return False
 
 
+def detect_requested_product(question: str) -> str | None:
+    q = normalize_whitespace(question).lower()
+
+    product_map = {
+        "word": ["word", "microsoft word"],
+        "excel": ["excel", "microsoft excel"],
+        "powerpoint": ["powerpoint", "ppt", "microsoft powerpoint"],
+        "outlook": ["outlook", "outlook on the web", "owa", "new outlook"],
+        "teams": ["teams", "microsoft teams"],
+        "sharepoint": ["sharepoint"],
+        "onedrive": ["onedrive"],
+        "exchange": ["exchange", "exchange online", "mail flow", "quarantine"],
+        "azure": ["azure", "azure portal", "azureportal"],
+        "entra": ["entra", "microsoft entra", "azure active directory", "azuread"],
+        "purview": ["purview", "microsoft purview", "compliance center", "compliancecenterv2"],
+        "security": ["security", "microsoft 365 defender", "defender"],
+        "power platform": ["power platform", "power apps", "power automate", "power pages", "dynamics 365"],
+        "search": ["microsoft search", "search & intelligence", "search and intelligence", "bing for business"],
+        "copilot": ["copilot", "microsoft 365 copilot"],
+        "loop": ["loop", "microsoft loop"],
+        "forms": ["forms", "microsoft forms"],
+        "planner": ["planner", "microsoft planner"],
+        "to do": ["to do", "todo", "microsoft to do"],
+        "onenote": ["onenote", "one note"],
+        "lists": ["lists", "microsoft lists"],
+        "stream": ["stream", "microsoft stream"],
+        "sway": ["sway", "microsoft sway"],
+        "visio": ["visio", "microsoft visio"],
+        "whiteboard": ["whiteboard", "microsoft whiteboard"],
+        "people": ["people", "contacts"],
+        "clipchamp": ["clipchamp"],
+        "engage": ["engage", "viva engage", "yammer"],
+        "yammer": ["yammer", "viva engage"],
+        "connections": ["connections", "viva connections"],
+        "insights": ["insights", "viva insights"],
+        "learning": ["learning", "viva learning"],
+        "learning activities": ["learning activities"],
+        "kaizala": ["kaizala"],
+        "viva": ["viva", "microsoft viva"],
+        "power apps": ["power apps"],
+        "power automate": ["power automate"],
+        "power pages": ["power pages"],
+        "m365 apps": ["microsoft 365 apps", "office apps", "microsoft 365 app"],
+        "graph": ["graph", "microsoft graph", "webhook", "subscription", "delta query", "api"],
+        "office": ["office", "microsoft 365", "office 365", "m365"],
+    }
+
+    for product, terms in product_map.items():
+        if any(term in q for term in terms):
+            return product
+
+    return None
+
+
+def retrieved_chunks_match_product(requested_product: str | None, chunks: list[dict[str, Any]]) -> bool:
+    if not requested_product:
+        return True
+
+    top_text = " ".join(
+        (
+            str(chunk.get("source_type") or "") + " "
+            + str(chunk.get("name") or "") + " "
+            + str(chunk.get("content") or "")
+        ).lower()
+        for chunk in chunks[:3]
+    )
+
+    product_terms = {
+        "word": ["word", "microsoft word", "document", "autoformat", "autocorrect"],
+        "excel": ["excel", "worksheet", "workbook", "formula", "spreadsheet"],
+        "powerpoint": ["powerpoint", "presentation", "slide", "slides"],
+        "outlook": ["outlook", "mailbox", "signature", "email", "owa"],
+        "teams": ["teams", "meeting", "channel", "chat"],
+        "sharepoint": ["sharepoint", "site", "document library", "list"],
+        "onedrive": ["onedrive", "sync", "files on-demand", "sharing"],
+        "exchange": ["exchange", "exchange online", "mail flow", "quarantine", "transport"],
+        "azure": ["azure", "subscription", "resource group", "virtual machine", "portal.azure.com"],
+        "entra": ["entra", "azure active directory", "identity", "conditional access", "directory"],
+        "purview": ["purview", "compliance", "risk", "data loss prevention", "retention"],
+        "security": ["security", "defender", "incident", "threat", "secure score"],
+        "power platform": ["power platform", "power apps", "power automate", "power pages", "dataverse", "dynamics 365"],
+        "search": ["microsoft search", "search", "bing", "search & intelligence"],
+        "copilot": ["copilot", "prompt", "grounding", "agent"],
+        "loop": ["loop", "workspace", "component"],
+        "forms": ["forms", "survey", "quiz", "response"],
+        "planner": ["planner", "task", "plan", "bucket"],
+        "to do": ["to do", "task", "list"],
+        "onenote": ["onenote", "notebook", "section", "page"],
+        "lists": ["lists", "list item", "column formatting"],
+        "stream": ["stream", "video", "meeting recording"],
+        "sway": ["sway", "interactive report"],
+        "visio": ["visio", "diagram", "flowchart"],
+        "whiteboard": ["whiteboard", "canvas", "ink"],
+        "people": ["people", "contact", "contacts"],
+        "clipchamp": ["clipchamp", "video editing"],
+        "engage": ["engage", "yammer", "community", "conversation"],
+        "yammer": ["yammer", "community", "conversation"],
+        "connections": ["connections", "dashboard", "viva"],
+        "insights": ["insights", "viva insights", "productivity", "wellbeing"],
+        "learning": ["learning", "viva learning", "course"],
+        "learning activities": ["learning activities"],
+        "kaizala": ["kaizala", "mobile chat"],
+        "viva": ["viva", "insights", "connections", "learning", "engage"],
+        "power apps": ["power apps", "canvas app", "model-driven"],
+        "power automate": ["power automate", "flow", "automation"],
+        "power pages": ["power pages", "website", "portal"],
+        "m365 apps": ["microsoft 365 apps", "office apps", "click-to-run"],
+        "graph": ["graph", "subscription", "webhook", "permission", "api", "delta query"],
+        "office": [
+            "office",
+            "microsoft 365",
+            "word",
+            "excel",
+            "powerpoint",
+            "outlook",
+            "teams",
+            "sharepoint",
+            "onedrive",
+        ],
+    }
+
+    expected_terms = product_terms.get(requested_product, [requested_product])
+    return any(term in top_text for term in expected_terms)
+
+
+def should_force_web_fallback_for_product_mismatch(question: str, chunks: list[dict[str, Any]]) -> bool:
+    requested_product = detect_requested_product(question)
+    if not requested_product:
+        return False
+
+    return not retrieved_chunks_match_product(requested_product, chunks)
+
+
 # --------------------------------------------------------------------
 # Prompt construction and answer repair
 # --------------------------------------------------------------------
@@ -1030,7 +1163,7 @@ Hard rules:
 - Do not rename any section.
 - Do not use bullets in Direct answer.
 - Do not use numbered steps unless the question is process-oriented and the context supports a sequence.
-- If the answer is not supported, say exactly: \"I cannot confirm this from the indexed Office365 sources.\"
+- If the answer is not supported, say exactly: "I cannot confirm this from the indexed Office365 sources."
 
 Behavior rules:
 - Never imply certainty beyond the evidence.
@@ -1594,6 +1727,9 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
     retrieval_quality = assess_retrieval_quality(chunks, route, used_fallback)
 
     if not route_sources_match_user_intent(route, chunks):
+        retrieval_quality = "weak"
+
+    if should_force_web_fallback_for_product_mismatch(question, chunks):
         retrieval_quality = "weak"
 
     if question_requires_web_fallback(question, chunks, route, retrieval_quality):
